@@ -32,6 +32,7 @@ def build_review_prompt(
     pr_description: str = "",
     existing_comments: list[UnresolvedThread] | None = None,
     code_context: str = "",
+    static_findings: str = "",
     learned_rules: list[str] | None = None,
     custom_rules: list[dict[str, str]] | None = None,
     file_history: dict | None = None,
@@ -98,11 +99,14 @@ def build_review_prompt(
         footguns=footguns,
     )
 
-    # Build user message with optional code context before diffs
+    # Model input is diff hunks plus optional compact static scan JSON only.
     user_parts = []
     if code_context:
         user_parts.append(code_context)
     user_parts.extend(file_contexts)
+    if static_findings and static_findings.strip() and static_findings.strip() != "[]":
+        safe_findings = static_findings.replace("```", "'''")
+        user_parts.append(f"## Static scan (JSON)\n\n```json\n{safe_findings}\n```")
 
     return [
         *split_system_prompt(system_content),

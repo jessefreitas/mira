@@ -117,6 +117,22 @@ def mock_llm(sample_llm_response_text: str) -> LLMProvider:
     llm.complete = AsyncMock(return_value=sample_llm_response_text)
     llm.count_tokens = MagicMock(return_value=100)
     llm.usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+
+    async def submit_review(*args, **kwargs):
+        raw = await llm.review(*args)
+        return {
+            "tool_calls": [
+                {
+                    "id": "submit",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": raw,
+                    },
+                }
+            ]
+        }
+
+    llm.complete_agentic = AsyncMock(side_effect=submit_review)
     return llm
 
 
@@ -139,6 +155,7 @@ def mock_provider(sample_diff_text: str) -> AsyncMock:
     provider.find_bot_comment = AsyncMock(return_value=None)
     provider.update_comment = AsyncMock()
     provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+    provider.get_repo_tree.return_value = []
     return provider
 
 
@@ -1381,6 +1398,7 @@ class TestThreadResolution:
 
         config = MiraConfig()
         config.review.auto_resolve_conversations = False
+        config.review.agentic_tools = False
         engine = ReviewEngine(
             config=config, llm=llm, provider=provider_with_threads, bot_name="mira"
         )
@@ -2648,7 +2666,10 @@ class TestAgenticToolsOnIndexedRepos:
         return mock_provider
 
     @pytest.mark.asyncio
-    async def test_fetcher_set_on_indexed_repo_with_agentic_tools(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("code_context", [True, False])
+    async def test_fetcher_set_on_indexed_repo_with_agentic_tools(
+        self, monkeypatch, tmp_path, code_context
+    ):
         """When agentic_tools=True and index has data, _agentic_source_fetcher
         is set so the reviewer can use read_file/grep_repo."""
         from unittest.mock import MagicMock
@@ -2667,7 +2688,7 @@ class TestAgenticToolsOnIndexedRepos:
 
         config = MiraConfig()
         config.review.agentic_tools = True
-        config.review.code_context = True
+        config.review.code_context = code_context
         config.review.security_pass = False
         config.review.self_critique = False
 
@@ -2701,6 +2722,7 @@ class TestAgenticToolsOnIndexedRepos:
 
         config = MiraConfig()
         config.review.agentic_tools = False
+        config.review.security_agentic = False
         config.review.code_context = True
         config.review.security_pass = False
         config.review.self_critique = False
@@ -2932,3 +2954,46 @@ class TestAgenticSecurityPass(TestAgenticToolsOnIndexedRepos):
         main_llm.complete_with_tools.assert_called_once()
         assert len(out) == 1
         assert out[0].source_pass == "security"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local_repo", [True, False])
+async def test_revision_checks_use_worker_only_with_local_repo(
+    mock_llm, mock_provider, tmp_path, monkeypatch, local_repo
+):
+    import threading
+
+    main_thread = threading.get_ident()
+    scans = []
+    checks = []
+    mock_provider.get_pr_info.return_value = replace(
+        mock_provider.get_pr_info.return_value, head_sha="reviewed-sha"
+    )
+
+    def scan(paths, root, ref):
+        assert threading.get_ident() != main_thread
+        assert root == tmp_path
+        assert ref == "reviewed-sha"
+        scans.append(paths)
+        return "[]"
+
+    def check(path, line, ref, root):
+        assert threading.get_ident() != main_thread
+        assert root == tmp_path
+        assert ref == "reviewed-sha"
+        checks.append(path)
+        return True
+
+    monkeypatch.setattr("mira.core.engine.compact_findings_at_ref", scan)
+    monkeypatch.setattr("mira.core.engine._comment_line_exists_at_ref", check)
+    config = MiraConfig()
+    config.review.agentic_tools = False
+    config.review.security_pass = False
+    config.review.self_critique = False
+    engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+    if local_repo:
+        engine._local_repo_path = tmp_path
+    result = await engine.review_pr("https://github.com/test/repo/pull/1")
+    assert result.comments
+    assert bool(scans) is local_repo
+    assert bool(checks) is local_repo
