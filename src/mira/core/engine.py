@@ -32,7 +32,7 @@ from mira.core.passes import (
     self_critique,
 )
 from mira.core.priority import rank_files
-from mira.core.static_scan import compact_findings
+from mira.core.static_scan import compact_findings_at_ref
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
 from mira.index.context import build_code_context
@@ -412,15 +412,17 @@ def _diff_line_map(diff_text: str) -> dict[str, set[int]]:
 def _comment_line_exists_at_ref(path: str, line: int, ref: str, repo_root: Path) -> bool:
     """Validate that path:line exists in git at the given commit ref."""
     if not ref or ref.startswith("-"):
-        return False
+        return True
     try:
         # If ref is not a real commit object in this repository (e.g. synthetic test mock),
         # skip git show validation and keep the comment.
         check = subprocess.run(
-            ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=5,
         )
@@ -1014,13 +1016,17 @@ class ReviewEngine:
                     len(unanchorable),
                     ", ".join(f"{c.path}:{c.line}" for c in unanchorable),
                 )
-            if pr_info.head_sha:
-                repo_root = Path(getattr(self, "_local_repo_path", Path.cwd()))
-                kept = [
-                    c
-                    for c in kept
-                    if _comment_line_exists_at_ref(c.path, c.line, pr_info.head_sha, repo_root)
-                ]
+            local_repo = getattr(self, "_local_repo_path", None)
+            if pr_info.head_sha and local_repo:
+                valid_lines = await _asyncio.to_thread(
+                    lambda: [
+                        _comment_line_exists_at_ref(
+                            c.path, c.line, pr_info.head_sha, Path(local_repo)
+                        )
+                        for c in kept
+                    ]
+                )
+                kept = [c for c, valid in zip(kept, valid_lines, strict=True) if valid]
             result.comments = kept
             if result.key_issues:
                 result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
@@ -1447,7 +1453,35 @@ class ReviewEngine:
                 return None
 
         async def _build_context() -> str:
+            pr_info = getattr(self, "_pr_info", None)
+            if self.provider and pr_info:
+                self._agentic_source_fetcher = None
+                self._agentic_repo_tree = []
+            if (
+                self.provider
+                and pr_info
+                and (self.config.review.agentic_tools or self.config.review.security_agentic)
+            ):
+                from mira.index.context import ProviderSourceFetcher
+
+                self._agentic_source_fetcher = ProviderSourceFetcher(
+                    self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
+                )
             if not self.config.review.code_context:
+                if (
+                    self._agentic_source_fetcher is not None
+                    and self.provider is not None
+                    and pr_info is not None
+                    and hasattr(self.provider, "get_repo_tree")
+                ):
+                    try:
+                        self._agentic_repo_tree = sorted(
+                            await self.provider.get_repo_tree(
+                                pr_info, pr_info.head_sha or pr_info.head_branch
+                            )
+                        )
+                    except Exception as exc:
+                        logger.debug("Repo tree fetch failed: %s", exc)
                 return ""
             try:
                 pr_info = getattr(self, "_pr_info", None)
@@ -1458,7 +1492,7 @@ class ReviewEngine:
                         from mira.index.context import ProviderSourceFetcher
 
                         source_fetcher = ProviderSourceFetcher(
-                            self.provider, pr_info, pr_info.head_branch
+                            self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
                         )
                     changed_paths = [f.path for f in filtered]
                     ctx = await build_code_context(
@@ -1487,7 +1521,9 @@ class ReviewEngine:
                         if hasattr(self.provider, "get_repo_tree"):
                             try:
                                 tree_paths = set(
-                                    await self.provider.get_repo_tree(pr_info, pr_info.head_branch)
+                                    await self.provider.get_repo_tree(
+                                        pr_info, pr_info.head_sha or pr_info.head_branch
+                                    )
                                 )
                             except Exception as exc:
                                 logger.debug("Repo tree fetch failed: %s", exc)
@@ -1668,8 +1704,16 @@ class ReviewEngine:
                     chunk_history = {
                         f.path: file_history[f.path] for f in chunk.files if f.path in file_history
                     }
-                    repo_root = Path(getattr(self, "_local_repo_path", Path.cwd()))
-                    static_findings = compact_findings([f.path for f in chunk.files], repo_root)
+                    static_findings = "[]"
+                    local_repo = getattr(self, "_local_repo_path", None)
+                    scan_pr = getattr(self, "_pr_info", None)
+                    if local_repo and scan_pr and scan_pr.head_sha:
+                        static_findings = await _asyncio.to_thread(
+                            compact_findings_at_ref,
+                            [f.path for f in chunk.files],
+                            Path(local_repo),
+                            scan_pr.head_sha,
+                        )
                     messages = build_review_prompt(
                         files=chunk.files,
                         config=self.config,
