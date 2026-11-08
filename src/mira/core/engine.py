@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import subprocess
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -32,6 +34,7 @@ from mira.core.passes import (
 from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
+from mira.core.static_scan import compact_findings
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -404,6 +407,23 @@ def _diff_line_map(diff_text: str) -> dict[str, set[int]]:
         for h in f.hunks:
             covered.update(range(h.target_start, h.target_start + h.target_length))
     return lines
+
+
+def _comment_line_exists_at_ref(path: str, line: int, ref: str, repo_root: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "show", f"{ref}:{path}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    return 0 < line <= len(proc.stdout.splitlines())
 
 
 def _drop_unanchorable_comments(
@@ -1624,6 +1644,8 @@ class ReviewEngine:
                     chunk_history = {
                         f.path: file_history[f.path] for f in chunk.files if f.path in file_history
                     }
+                    repo_root = Path(getattr(self, "_local_repo_path", Path.cwd()))
+                    static_findings = compact_findings([f.path for f in chunk.files], repo_root)
                     messages = build_review_prompt(
                         files=chunk.files,
                         config=self.config,
@@ -1631,6 +1653,7 @@ class ReviewEngine:
                         pr_description=pr_description,
                         existing_comments=base_existing or None,
                         code_context=code_context_block,
+                        static_findings=static_findings,
                         learned_rules=learned_rules or None,
                         custom_rules=custom_rules or None,
                         file_history=chunk_history or None,
