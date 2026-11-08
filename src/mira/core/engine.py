@@ -410,6 +410,9 @@ def _diff_line_map(diff_text: str) -> dict[str, set[int]]:
 
 
 def _comment_line_exists_at_ref(path: str, line: int, ref: str, repo_root: Path) -> bool:
+    """Validate that path:line exists in git at the given commit ref."""
+    if not ref or ref.startswith("-"):
+        return False
     try:
         # If ref is not a real commit object in this repository (e.g. synthetic test mock),
         # skip git show validation and keep the comment.
@@ -428,6 +431,8 @@ def _comment_line_exists_at_ref(path: str, line: int, ref: str, repo_root: Path)
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=30,
         )

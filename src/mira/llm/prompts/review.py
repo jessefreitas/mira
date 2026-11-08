@@ -104,8 +104,9 @@ def build_review_prompt(
     if code_context:
         user_parts.append(code_context)
     user_parts.extend(file_contexts)
-    if static_findings:
-        user_parts.append(f"## Static scan (JSON)\n\n```json\n{static_findings}\n```")
+    if static_findings and static_findings.strip() and static_findings.strip() != "[]":
+        safe_findings = static_findings.replace("```", "'''")
+        user_parts.append(f"## Static scan (JSON)\n\n```json\n{safe_findings}\n```")
 
     return [
         *split_system_prompt(system_content),
